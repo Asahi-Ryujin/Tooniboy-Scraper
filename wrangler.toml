@@ -1,0 +1,16 @@
+name = "tooniboy-worker-api"
+main = "src/index.js"
+compatibility_date = "2026-11-12"
+workers_dev = true
+
+[vars]
+SITE_BASE_URL = "https://tooniboy.xyz"
+ALLOWED_ORIGINS = "*"
+REQUEST_TIMEOUT_MS = "12000"
+MAX_HTML_BYTES = "5242880"
+CACHE_TTL_SECONDS = "120"
+UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+# AES_KEY is intentionally not stored here. Set it as a Worker secret:
+#   npx wrangler secret put AES_KEY
