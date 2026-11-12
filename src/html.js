@@ -7,7 +7,7 @@ const ENTITY_MAP = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
   ndash: '–', mdash: '—', hellip: '…', rsquo: '’', lsquo: '‘',
   rdquo: '”', ldquo: '“', copy: '©', reg: '®', trade: '™', bull: '•',
-  middot: '·', laquo: '«', raquo: '»', times: '×', nbsp: ' '
+  middot: '·', laquo: '«', raquo: '»', times: '×'
 };
 
 export function decodeEntities(value = '') {
