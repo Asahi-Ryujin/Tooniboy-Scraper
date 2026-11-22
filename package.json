@@ -1,9 +1,9 @@
 {
-  "name": "tooniboy-cloudflare-worker-api",
-  "version": "1.0.0",
+  "name": "anime-catalog-edge-api",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Encrypted Cloudflare Worker JSON API for Tooniboy anime, movies, genres, episodes, stream and download metadata.",
+  "description": "Compact encrypted anime and media metadata API for Cloudflare Workers.",
   "scripts": {
     "test": "node --test",
     "dev": "wrangler dev",
