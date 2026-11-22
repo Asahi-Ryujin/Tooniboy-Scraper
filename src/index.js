@@ -2,9 +2,9 @@ import {
   parseGenres, parseListing, parseHome, parseDetail, parseEpisode,
   parseMovie, parseSeason, normalizeServerConfig, parseServerConfigJson
 } from './parsers.js';
+import { toPublicData, filterPublicServerConfigs } from './normalize.js';
 
-const VERSION = '1.0.0';
-const SITE_HOSTS = new Set(['tooniboy.xyz', 'www.tooniboy.xyz']);
+const VERSION = '1.1.0';
 const encoder = new TextEncoder();
 const MAX_PAGE_BYTES_DEFAULT = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 12_000;
@@ -16,10 +16,12 @@ function asInt(value, fallback, min, max) {
 }
 
 function siteBase(env) {
-  const raw = env.SITE_BASE_URL || 'https://tooniboy.xyz';
-  const url = new URL(raw);
-  if (url.protocol !== 'https:' || !SITE_HOSTS.has(url.hostname.toLowerCase())) {
-    throw new Error('SITE_BASE_URL must use https://tooniboy.xyz or https://www.tooniboy.xyz');
+  const raw = String(env.UPSTREAM_BASE_URL || '').trim();
+  if (!raw) throw httpError(503, 'upstream_not_configured', 'The upstream service is not configured.');
+  let url;
+  try { url = new URL(raw); } catch { throw httpError(503, 'upstream_not_configured', 'The upstream service configuration is invalid.'); }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || (url.pathname && url.pathname !== '/')) {
+    throw httpError(503, 'upstream_not_configured', 'The upstream service must be a valid HTTPS origin.');
   }
   return url.origin;
 }
@@ -102,13 +104,6 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-function base64ToBytes(value) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
 async function deriveAes128Key(secret) {
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(secret));
   // SHA-256 gives 32 bytes. First 16 bytes provide the 128-bit AES key requested.
@@ -117,8 +112,8 @@ async function deriveAes128Key(secret) {
 }
 
 async function encryptPayload(payload, secret) {
-  if (!secret || String(secret).length < 16) {
-    throw httpError(503, 'missing_aes_key', 'Worker secret AES_KEY is missing or too short. Configure a random secret of at least 16 characters.');
+  if (!secret || String(secret).length < 8) {
+    throw httpError(503, 'missing_aes_key', 'Response encryption is not configured.');
   }
   const key = await deriveAes128Key(String(secret));
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -164,7 +159,7 @@ async function plainJsonResponse(request, env, payload, status = 200) {
 async function fetchSite(path, env, options = {}) {
   const base = siteBase(env);
   let target = new URL(path, `${base}/`);
-  if (target.origin !== base) throw httpError(400, 'invalid_upstream', 'Only the configured Tooniboy origin can be fetched.');
+  if (target.origin !== base) throw httpError(400, 'invalid_upstream', 'The requested upstream path is not permitted.');
   const timeoutMs = asInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 1000, 30_000);
   const maxBytes = asInt(env.MAX_HTML_BYTES, MAX_PAGE_BYTES_DEFAULT, 128 * 1024, 10 * 1024 * 1024);
   const ttl = options.xhr ? 0 : asInt(env.CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL, 0, 3600);
@@ -192,32 +187,32 @@ async function fetchSite(path, env, options = {}) {
         throw httpError(502, 'redirect_limit', 'Upstream returned a missing redirect target or exceeded the redirect limit.');
       }
       const next = new URL(location, target.href);
-      if (next.protocol !== 'https:' || !SITE_HOSTS.has(next.hostname.toLowerCase())) {
+      if (next.protocol !== 'https:' || next.origin !== base) {
         try { await response.body?.cancel(); } catch {}
-        throw httpError(502, 'unsafe_redirect', 'Upstream redirect target is outside the permitted HTTPS Tooniboy hosts.');
+        throw httpError(502, 'unsafe_redirect', 'Upstream redirect target is not permitted.');
       }
       try { await response.body?.cancel(); } catch {}
       target = next;
       redirects++;
     }
     const finalUrl = response.url ? new URL(response.url) : target;
-    if (!SITE_HOSTS.has(finalUrl.hostname.toLowerCase()) || finalUrl.protocol !== 'https:') {
-      throw httpError(502, 'unsafe_redirect', 'Upstream response came from outside the permitted Tooniboy host.');
+    if (finalUrl.origin !== base || finalUrl.protocol !== 'https:') {
+      throw httpError(502, 'unsafe_redirect', 'Upstream response came from an unexpected origin.');
     }
     if (!response.ok) {
-      throw httpError(response.status >= 400 && response.status < 500 ? 502 : 503, 'upstream_http_error', `Tooniboy returned HTTP ${response.status}.`, { upstreamStatus: response.status, path: target.pathname });
+      throw httpError(response.status >= 400 && response.status < 500 ? 502 : 503, 'upstream_http_error', `The upstream service returned HTTP ${response.status}.`);
     }
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (contentLength > maxBytes) throw httpError(502, 'upstream_too_large', 'The upstream page exceeded the configured response-size limit.');
     const body = await readLimitedText(response, maxBytes);
     if (!options.json && /(?:Just a moment\.\.\.|cf-chl-|challenge-platform|Attention Required! \| Cloudflare)/i.test(body.slice(0, 150_000))) {
-      throw httpError(502, 'upstream_challenge', 'Tooniboy returned a bot/challenge page instead of the requested HTML. The Worker does not attempt to bypass it.');
+      throw httpError(502, 'upstream_challenge', 'The upstream returned a verification page instead of the requested content.');
     }
     return { body, url: finalUrl.href, status: response.status, contentType: response.headers.get('content-type') || '' };
   } catch (error) {
-    if (controller.signal.aborted || error?.name === 'AbortError' || error === 'upstream_timeout') throw httpError(504, 'upstream_timeout', `Tooniboy request timed out after ${timeoutMs} ms.`);
+    if (controller.signal.aborted || error?.name === 'AbortError' || error === 'upstream_timeout') throw httpError(504, 'upstream_timeout', `The upstream request timed out after ${timeoutMs} ms.`);
     if (error?.status) throw error;
-    throw httpError(502, 'upstream_fetch_failed', error?.message || 'Failed to fetch Tooniboy.');
+    throw httpError(502, 'upstream_fetch_failed', 'Could not retrieve the requested content from the upstream service.');
   } finally {
     clearTimeout(timer);
   }
@@ -237,15 +232,8 @@ function listingType(value) {
   return type;
 }
 
-function wrapData(data, source, extra = {}) {
-  return {
-    success: true,
-    api: 'tooniboy-worker',
-    version: VERSION,
-    source: { site: 'tooniboy.xyz', url: source, retrievedAt: new Date().toISOString() },
-    data,
-    ...extra
-  };
+function wrapData(data, baseUrl = '') {
+  return { success: true, version: VERSION, data: toPublicData(data, baseUrl) };
 }
 
 async function getServerConfigs(base, env) {
@@ -265,18 +253,19 @@ function pathFromSlug(prefix, slug) {
 }
 
 async function routeApi(request, env, ctx) {
-  const base = siteBase(env);
   const incoming = new URL(request.url);
   const path = incoming.pathname.replace(/\/+$/, '') || '/';
   const q = incoming.searchParams;
 
   if (path === '/api/health') {
-    return jsonResponse(request, env, wrapData({ status: 'ok', encryption: 'AES-128-GCM', sourceHost: 'tooniboy.xyz' }, `${base}/`));
+    return jsonResponse(request, env, wrapData({ status: 'ok', encryption: 'AES-128-GCM' }));
   }
+
+  const base = siteBase(env);
 
   if (path === '/api/home') {
     const page = await fetchSite('/home', env);
-    return jsonResponse(request, env, wrapData(parseHome(page.body, page.url), page.url));
+    return jsonResponse(request, env, wrapData(parseHome(page.body, page.url), base));
   }
 
   if (path === '/api/genres') {
@@ -285,10 +274,10 @@ async function routeApi(request, env, ctx) {
     const group = String(q.get('group') || '').toLowerCase();
     if (group) {
       if (!data.groups[group]) throw httpError(404, 'genre_group_not_found', `Unknown genre group: ${group}`);
-      data.genres = data.groups[group];
-      data.count = data.genres.length;
+      const items = data.groups[group];
+      return jsonResponse(request, env, wrapData({ group, count: items.length, items }, base));
     }
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   const genreMatch = path.match(/^\/api\/(?:genre|genres|category)\/(.+)$/i);
@@ -299,7 +288,7 @@ async function routeApi(request, env, ctx) {
     const upstreamPath = categoryPagePath(slug, type, pageNo);
     const page = await fetchSite(upstreamPath, env);
     const data = parseListing(page.body, page.url, { category: decodeURIComponent(slug), type });
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   if (path === '/api/catalog') {
@@ -307,7 +296,7 @@ async function routeApi(request, env, ctx) {
     const pageNo = asInt(q.get('page'), 1, 1, 500);
     const page = await fetchSite(`/category/anime?${new URLSearchParams({ type, page: String(pageNo) })}`, env);
     const data = parseListing(page.body, page.url, { category: 'anime', type });
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   if (path === '/api/search') {
@@ -318,12 +307,13 @@ async function routeApi(request, env, ctx) {
     const page = await fetchSite(`/?${searchParams.toString()}`, env);
     const data = parseListing(page.body, page.url, { type: 'search' });
     data.query = term;
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   if (path === '/api/servers') {
     const configs = await getServerConfigs(base, env);
-    return jsonResponse(request, env, wrapData({ count: configs.length, servers: configs }, `${base}/public/servers`));
+    const servers = filterPublicServerConfigs(configs);
+    return jsonResponse(request, env, wrapData({ count: servers.length, servers }, base));
   }
 
   const seasonMatch = path.match(/^\/api\/season\/([^/]+)\/(\d+)$/i);
@@ -337,9 +327,9 @@ async function routeApi(request, env, ctx) {
     const seasonPath = seasonRecord?.path || `${seriesPath}/season/${season}`;
     const page = await fetchSite(seasonPath, env, { xhr: true, referer: detailPage.url });
     const data = parseSeason(page.body, page.url, seriesPath, season);
-    data.series = { title: detail.title, url: detailPage.url };
+    data.series = { title: detail.title };
     data.requestHeaders = { 'X-Requested-With': 'XMLHttpRequest' };
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   const episodeMatch = path.match(/^\/api\/episode\/(.+)$/i);
@@ -349,7 +339,7 @@ async function routeApi(request, env, ctx) {
       fetchSite(episodePath, env), getServerConfigs(base, env)
     ]);
     const data = parseEpisode(page.body, page.url, configs);
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   const movieMatch = path.match(/^\/api\/(?:movie|movies)\/(.+)$/i);
@@ -359,7 +349,7 @@ async function routeApi(request, env, ctx) {
       fetchSite(moviePath, env), getServerConfigs(base, env)
     ]);
     const data = parseMovie(page.body, page.url, configs);
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   const seriesMatch = path.match(/^\/api\/series\/(.+)$/i);
@@ -367,7 +357,7 @@ async function routeApi(request, env, ctx) {
     const seriesPath = pathFromSlug('series', seriesMatch[1]);
     const page = await fetchSite(seriesPath, env);
     const data = parseDetail(page.body, page.url, { kind: 'series' });
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
   if (path === '/api/details') {
@@ -386,10 +376,10 @@ async function routeApi(request, env, ctx) {
     } else {
       data = parseDetail(page.body, page.url, { kind: 'series' });
     }
-    return jsonResponse(request, env, wrapData(data, page.url));
+    return jsonResponse(request, env, wrapData(data, base));
   }
 
-  throw httpError(404, 'route_not_found', 'Unknown endpoint. See README.md for supported routes.');
+  throw httpError(404, 'route_not_found', 'The requested API endpoint does not exist.');
 }
 
 async function handle(request, env = {}, ctx = {}) {
@@ -399,11 +389,11 @@ async function handle(request, env = {}, ctx = {}) {
     return new Response(null, { status: 204, headers });
   }
   if (method !== 'GET' && method !== 'HEAD') {
-    return jsonResponse(request, env, { success: false, api: 'tooniboy-worker', version: VERSION, error: { code: 'method_not_allowed', message: 'Only GET, HEAD, and OPTIONS are supported.' } }, 405);
+    return jsonResponse(request, env, { success: false, version: VERSION, error: { code: 'method_not_allowed', message: 'Only GET, HEAD, and OPTIONS are supported.' } }, 405);
   }
   const path = new URL(request.url).pathname;
   if (path === '/' || path === '/health' || path === '/healthz') {
-    const response = await plainJsonResponse(request, env, { success: true, service: 'tooniboy-worker-api', version: VERSION, status: 'ok' });
+    const response = await plainJsonResponse(request, env, { success: true, version: VERSION, status: 'ok' });
     return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
   }
   try {
@@ -414,12 +404,10 @@ async function handle(request, env = {}, ctx = {}) {
     const status = Number(error?.status) || 500;
     const payload = {
       success: false,
-      api: 'tooniboy-worker',
       version: VERSION,
       error: {
         code: error?.code || 'internal_error',
-        message: error?.message || 'Unexpected Worker error.',
-        ...(error?.details ? { details: error.details } : {})
+        message: error?.message || 'Unexpected Worker error.'
       }
     };
     try { return await jsonResponse(request, env, payload, status); }

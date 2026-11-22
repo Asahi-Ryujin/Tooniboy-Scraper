@@ -117,10 +117,11 @@ export function parseGenres(html, url) {
       });
     }
   }
-  const items = [...categories.values()];
+  const languageNames = new Set(['language', 'bengali', 'bangla', 'hindi', 'tamil', 'telugu', 'english', 'japanese', 'japaneses', 'korean', 'kannada', 'malayalam', 'malyalam', 'marathi', 'chinese', 'fan hindi']);
+  const items = [...categories.values()].filter(item => item.group !== 'language' && !languageNames.has(String(item.name).trim().toLowerCase()) && !String(item.slug).toLowerCase().startsWith('language/'));
   const groups = {};
   for (const item of items) (groups[item.group] ||= []).push(item);
-  return { count: items.length, groups, genres: items, sourceUrl: url };
+  return { count: items.length, groups };
 }
 
 function parseImage(node, baseUrl) {
@@ -158,7 +159,7 @@ function parseCards(root, baseUrl, mode = 'content') {
   const seen = new Set();
   for (const article of all(root, el => el.tag === 'article' && hasClass(el, 'post'))) {
     if (mode === 'episode' && !hasClass(article, 'episodes')) continue;
-    if (mode === 'content' && !hasAnyClass(article, ['movies', 'episodes'])) continue;
+    if (mode === 'content' && !hasAnyClass(article, ['movies', 'episodes', 'series'])) continue;
     const item = parseCard(article, baseUrl);
     if (!item || seen.has(item.url)) continue;
     seen.add(item.url);
@@ -169,20 +170,23 @@ function parseCards(root, baseUrl, mode = 'content') {
 
 function parsePagination(doc, baseUrl) {
   const nav = first(doc, el => el.tag === 'nav' && hasClass(el, 'pagination'));
-  if (!nav) return { currentPage: null, maxPage: null, nextPageUrl: null, previousPageUrl: null, pages: [] };
+  if (!nav) return { currentPage: Number(new URL(baseUrl).searchParams.get('page') || 1), maxPage: null, nextPage: null, previousPage: null, pages: [] };
   const links = all(nav, el => el.tag === 'a' && getAttr(el, 'href')).map(a => {
     const href = getAttr(a, 'href');
-    const parsed = absoluteUrl(href, baseUrl);
-    const number = Number(new URL(parsed).searchParams.get('page') || 0) || null;
-    return { label: text(a), url: parsed, page: number };
-  }).filter(x => x.url);
-  const numericPages = links.map(x => x.page).filter(Boolean);
+    let page = null;
+    try { page = Number(new URL(href, baseUrl).searchParams.get('page') || 0) || null; } catch {}
+    return { label: text(a), page };
+  }).filter(x => x.page);
+  const numericPages = links.map(x => x.page);
   const next = links.find(x => /^(?:next|›|»|>|next page)$/i.test(x.label));
   const previous = links.find(x => /^(?:previous|prev|‹|«|<|previous page)$/i.test(x.label));
   const current = Number(new URL(baseUrl).searchParams.get('page') || 1);
   return {
-    currentPage: current, maxPage: numericPages.length ? Math.max(...numericPages) : null,
-    nextPageUrl: next?.url || null, previousPageUrl: previous?.url || null, pages: links
+    currentPage: current,
+    maxPage: numericPages.length ? Math.max(...numericPages) : null,
+    nextPage: next?.page || null,
+    previousPage: previous?.page || null,
+    pages: links
   };
 }
 
@@ -196,8 +200,7 @@ export function parseListing(html, url, options = {}) {
     title: text(heading) || null,
     category: options.category || (new URL(url).pathname.match(/^\/category\/(.+?)\/?$/)?.[1] || null),
     type, page: pagination.currentPage || Number(new URL(url).searchParams.get('page') || 1),
-    count: articles.length, items: articles, pagination,
-    canonicalUrl: absoluteUrl(getMeta(doc, 'og:url') || getAttr(first(doc, el => el.tag === 'link' && String(getAttr(el, 'rel')).toLowerCase() === 'canonical'), 'href') || url, url)
+    count: articles.length, items: articles, pagination
   };
 }
 
@@ -216,12 +219,11 @@ export function parseHome(html, url) {
     sections.push({ title, type, count: items.length, items, moreUrl: more ? absoluteUrl(getAttr(more, 'href'), url) : null });
   }
   return {
-    title: 'Tooniboy Home', sections,
+    title: 'Home', sections,
     latestEpisodes: sections.filter(x => x.type === 'episodes').flatMap(x => x.items),
     latestSeries: sections.filter(x => x.type === 'series' && /^latest/i.test(x.title)).flatMap(x => x.items),
     latestMovies: sections.filter(x => x.type === 'movies' && /^latest/i.test(x.title)).flatMap(x => x.items),
-    categories: parseGenres(html, url).genres,
-    seo: parseSeo(doc, url)
+    categories: Object.values(parseGenres(html, url).groups).flat()
   };
 }
 
