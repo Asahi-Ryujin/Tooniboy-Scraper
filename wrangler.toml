@@ -5,6 +5,7 @@ workers_dev = true
 
 [vars]
 ALLOWED_ORIGINS = "*"
+UPSTREAM_BASE_URL ="https://tooniboy.xyz"
 REQUEST_TIMEOUT_MS = "12000"
 MAX_HTML_BYTES = "5242880"
 CACHE_TTL_SECONDS = "120"
