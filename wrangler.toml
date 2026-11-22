@@ -10,6 +10,11 @@ MAX_HTML_BYTES = "5242880"
 CACHE_TTL_SECONDS = "120"
 UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+AES_KEY = ""
+
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 # Configure these as secrets; do not commit their values:
 # npx wrangler secret put UPSTREAM_BASE_URL
