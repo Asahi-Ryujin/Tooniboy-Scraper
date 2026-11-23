@@ -13,6 +13,15 @@ UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537
 ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 AES_KEY = ""
 
+
+[[ratelimits]]
+name = "API_RATE_LIMITER"
+namespace_id = "7312459"
+
+[ratelimits.simple]
+limit = 120
+period = 60
+
 [observability]
 enabled = true
 head_sampling_rate = 1
