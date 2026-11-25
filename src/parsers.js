@@ -3,6 +3,64 @@ import {
   directChildren, hasClass, byId, mediaUrl, absoluteUrl, getMeta, linksFrom
 } from './html.js';
 
+const FALLBACK_CATEGORIES = [
+  ['Anime', 'anime', 'primary'],
+  ['Animation & Cartoon', 'cartoon', 'primary'],
+  ['Movies', 'movies', 'primary'],
+  ['Networks', 'networks', 'networks'],
+  ['Crunchyroll', 'crunchyroll', 'networks'],
+  ['ETV Bal Bharti', 'etv-bal-bharti', 'networks'],
+  ['Hungama', 'hungama', 'networks'],
+  ['NetFlix', 'netflix', 'networks'],
+  ['Nickelodean', 'nickelodean', 'networks'],
+  ['Cartoon Network', 'cartoon-network', 'networks'],
+  ['Kinds Zone Pluse', 'kinds-zone-pluse', 'networks'],
+  ['Disney', 'disney', 'networks'],
+  ['Sony Yay', 'sony-yay', 'networks'],
+  ['Genre', 'gener', 'genre'],
+  ['Action', 'action', 'genre'],
+  ['Adventure', 'adventure', 'genre'],
+  ['Animation', 'animation', 'genre'],
+  ['Comedy', 'comedy', 'genre'],
+  ['Crime', 'crime', 'genre'],
+  ['Drama', 'drama', 'genre'],
+  ['Family', 'family', 'genre'],
+  ['Fantasy', 'fantasy', 'genre'],
+  ['Horror', 'horror', 'genre'],
+  ['Kids', 'kids', 'genre'],
+  ['Martial ART', 'martial-art', 'genre'],
+  ['Mystery', 'mystery', 'genre'],
+  ['Romance', 'romance', 'genre'],
+  ['Sci-fi', 'sci-fi', 'genre'],
+  ['Sci-Fi & Fantasy', 'sci-fi-fantasy', 'genre'],
+  ['Sci-Fi & Fantasy', 'sci-fi-&-fantasy', 'detail-genre'],
+  ['Superhero', 'superhero', 'genre'],
+  ['Thriller', 'thriller', 'genre'],
+  ['War', 'war', 'genre'],
+  ['Action & Adventure', 'action-&-adventure', 'detail-genre'],
+  ['Anime Series', 'anime-series', 'detail-genre'],
+  ['Anime Movies', 'anime-movies', 'detail-genre'],
+  ['Language', 'language', 'language'],
+  ['Hindi', 'language/hindi-language', 'language'],
+  ['Tamil', 'language/tamil-language', 'language'],
+  ['Telugu', 'language/telugu', 'language'],
+  ['Fan Hindi', 'language/fan-hindi', 'language'],
+  ['Malyalam', 'language/malyalam', 'language'],
+  ['Kannada', 'language/kannada', 'language'],
+  ['Bengali', 'language/bengali', 'language'],
+  ['Marathi', 'language/marathi', 'language'],
+  ['English', 'language/english', 'language'],
+  ['Japaneses', 'language/japaneses', 'language'],
+  ['Korean', 'language/korean', 'language'],
+  ['Chinese', 'language/chinese', 'language'],
+  ['Anime Series - Crunchyroll', 'anime-series', 'detail-genre'],
+  ['Hindi', 'hindi', 'detail-genre'],
+  ['Tamil', 'tamil', 'detail-genre'],
+  ['Telugu', 'telugu', 'detail-genre'],
+  ['English', 'english', 'detail-genre'],
+  ['Japaneses', 'japaneses', 'detail-genre']
+];
+
 const cleanPath = value => String(value || '').replace(/\s+/g, '').replace(/\/+$/, '') || '/';
 const text = node => textOf(node);
 const hasAnyClass = (node, names) => names.some(name => hasClass(node, name));
@@ -19,7 +77,7 @@ function categoryFromHref(label, href, baseUrl, group = 'other', source = 'navig
   if (!match) return null;
   const slug = match[1].replace(/^\/+|\/+$/g, '');
   if (!slug) return null;
-  return { name: cleanText(label) || slug.replace(/[-&]+/g, ' '), slug, path: `/category/${slug}/`, group };
+  return { name: cleanText(label) || slug.replace(/[-&]+/g, ' '), slug, path: `/category/${slug}/`, url: absoluteUrl(href, baseUrl), apiEndpoint: `/api/genre/${slug}`, group, source };
 }
 
 export function parseGenres(html, url) {
@@ -52,7 +110,15 @@ export function parseGenres(html, url) {
     const record = categoryFromHref(text(a), getAttr(a, 'href'), url, 'detail-genre', 'page-metadata');
     if (record && !categories.has(record.slug.toLowerCase())) categories.set(record.slug.toLowerCase(), record);
   }
-  const items = [...categories.values()];
+  for (const [name, slug, group] of FALLBACK_CATEGORIES) {
+    if (!categories.has(slug.toLowerCase())) {
+      categories.set(slug.toLowerCase(), {
+        name, slug, path: `/category/${slug}/`, url: absoluteUrl(`/category/${slug}/`, url), apiEndpoint: `/api/genre/${slug}`, group, source: 'captured-navigation-fallback'
+      });
+    }
+  }
+  const languageNames = new Set(['language', 'bengali', 'bangla', 'hindi', 'tamil', 'telugu', 'english', 'japanese', 'japaneses', 'korean', 'kannada', 'malayalam', 'malyalam', 'marathi', 'chinese', 'fan hindi']);
+  const items = [...categories.values()].filter(item => item.group !== 'language' && !languageNames.has(String(item.name).trim().toLowerCase()) && !String(item.slug).toLowerCase().startsWith('language/'));
   const groups = {};
   for (const item of items) (groups[item.group] ||= []).push(item);
   return { count: items.length, groups };
@@ -141,7 +207,7 @@ export function parseListing(html, url, options = {}) {
 export function parseHome(html, url) {
   const doc = parseHTML(html);
   const sections = [];
-  for (const section of all(doc, el => el.tag === 'section' && hasAnyClass(el, ['widget_list_episodes', 'widget_list_movies_series']))) {
+  for (const section of all(doc, el => el.tag === 'section' && hasAnyClass(el, ['wdgt-home', 'widget_list_episodes', 'widget_list_movies_series']))) {
     const heading = first(section, el => (el.tag === 'h3' || el.tag === 'h2') && hasClass(el, 'section-title'));
     const title = text(heading);
     if (!title) continue;
@@ -150,15 +216,13 @@ export function parseHome(html, url) {
       : /movie/i.test(title) ? 'movies' : 'other';
     const items = parseCards(section, url, type === 'episodes' ? 'episode' : 'content');
     const more = first(section, el => el.tag === 'a' && /view more/i.test(text(el)) && getAttr(el, 'href'));
-    let morePath = null;
-    if (more) {
-      try { morePath = cleanPath(new URL(absoluteUrl(getAttr(more, 'href'), url)).pathname); } catch { /* omit malformed navigation */ }
-    }
-    sections.push({ title, type, count: items.length, items, morePath });
+    sections.push({ title, type, count: items.length, items, moreUrl: more ? absoluteUrl(getAttr(more, 'href'), url) : null });
   }
   return {
-    title: 'Home',
-    sections,
+    title: 'Home', sections,
+    latestEpisodes: sections.filter(x => x.type === 'episodes').flatMap(x => x.items),
+    latestSeries: sections.filter(x => x.type === 'series' && /^latest/i.test(x.title)).flatMap(x => x.items),
+    latestMovies: sections.filter(x => x.type === 'movies' && /^latest/i.test(x.title)).flatMap(x => x.items),
     categories: Object.values(parseGenres(html, url).groups).flat()
   };
 }
@@ -256,6 +320,20 @@ function parseEpisodeCards(doc, baseUrl, itemId = '') {
   return [...map.values()].sort((a, b) => a.season - b.season || a.episode - b.episode);
 }
 
+function parseSeo(doc, url) {
+  const canonical = first(doc, el => el.tag === 'link' && String(getAttr(el, 'rel')).toLowerCase().split(/\s+/).includes('canonical'));
+  return {
+    pageTitle: text(first(doc, el => el.tag === 'title')) || null,
+    canonicalUrl: canonical ? absoluteUrl(getAttr(canonical, 'href'), url) : url,
+    ogTitle: getMeta(doc, 'og:title'), ogDescription: getMeta(doc, 'og:description'),
+    ogImage: absoluteUrl(getMeta(doc, 'og:image'), url), ogUrl: absoluteUrl(getMeta(doc, 'og:url'), url),
+    twitterTitle: getMeta(doc, 'twitter:title', 'name'), twitterDescription: getMeta(doc, 'twitter:description', 'name'),
+    twitterImage: absoluteUrl(getMeta(doc, 'twitter:image', 'name'), url),
+    description: getMeta(doc, 'description', 'name'), robots: getMeta(doc, 'robots', 'name'),
+    locale: getMeta(doc, 'og:locale'), ogType: getMeta(doc, 'og:type')
+  };
+}
+
 function parseMediaCandidates(root, doc, url) {
   const banner = [];
   const poster = [];
@@ -333,18 +411,25 @@ export function parseDetail(html, url, options = {}) {
   }
   const trailerRoot = byId(doc, 'mdl-trailer');
   const trailerFrame = trailerRoot && first(trailerRoot, el => el.tag === 'iframe');
+  const commentForm = byId(doc, 'comment-form');
+  const postId = getAttr(byId(commentForm || doc, 'post_id'), 'value') || getAttr(byId(doc, 'post_id'), 'value') || '';
+  const commentSlug = getAttr(byId(doc, 'slug'), 'value') || '';
+  const socialLinks = all(doc, el => el.tag === 'a' && getAttr(el, 'href')).map(a => getAttr(a, 'href')).filter(href => /facebook\.com\/sharer|twitter\.com\/intent\/tweet/i.test(href));
   const relatedItems = parseRelated(doc, url).filter(x => x.url !== url);
   return {
     id: path, path, url, kind, title,
     poster, banner, mediaCandidates: [...new Set([banner, poster, ...media.banner, ...media.poster].filter(Boolean))],
     genres, tags,
-    metadata: { year, duration, language, quality, runningTime, rating: ratingText ? Number(ratingText) : null },
+    metadata: { year, duration, language, quality, runningTime, rating: ratingText ? Number(ratingText) : null, ratingSource: ratingText ? 'TMDB' : null },
     description,
     crew,
     seasons,
     episodes,
-    trailerAvailable: Boolean(trailerFrame),
-    related: relatedItems
+    trailerUrl: trailerFrame ? mediaUrl(trailerFrame, url) : '',
+    related: relatedItems,
+    social: { shareLinks: [...new Set(socialLinks)] },
+    comments: { postId: postId || null, slug: commentSlug || null },
+    seo: parseSeo(doc, url)
   };
 }
 
@@ -353,16 +438,12 @@ function normalizeServerName(name) {
 }
 
 export function normalizeServerConfig(value) {
-  const rows = Array.isArray(value) ? value
-    : Array.isArray(value?.data) ? value.data
-      : Array.isArray(value?.servers) ? value.servers
-        : Array.isArray(value?.data?.servers) ? value.data.servers
-          : [];
+  const rows = Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
   return rows.map(item => ({
     name: cleanText(item?.name || item?.nickname || ''),
     nickname: cleanText(item?.nickname || item?.name || ''),
     oldUrl: String(item?.oldUrl || ''), url: String(item?.url || ''),
-    order: Number(item?.order || 999), enabled: item?.enabled !== false,
+    order: Number(item?.order ?? 999), enabled: item?.enabled !== false,
     key: normalizeServerName(item?.nickname || item?.name || '')
   })).filter(item => item.name);
 }
@@ -458,25 +539,6 @@ function parseDownloadLinks(doc, url) {
   }).filter(x => x?.url);
 }
 
-
-function parseEpisodeNavigation(doc, url) {
-  const seasonAnchor = all(doc, el => el.tag === 'a' && /\/series\//i.test(getAttr(el, 'href')) && /season/i.test(text(el)))[0]
-    || all(doc, el => el.tag === 'a' && /\/series\//i.test(getAttr(el, 'href')))[0];
-  const nav = findClass(doc, 'epsdsnv');
-  const navEpisodes = nav
-    ? all(nav, el => el.tag === 'a' && /\/episode\//i.test(getAttr(el, 'href')))
-      .map(a => new URL(getAttr(a, 'href'), url).pathname)
-      .filter(path => path.startsWith('/') && !path.startsWith('//'))
-    : [];
-  return {
-    seriesUrl: seasonAnchor ? absoluteUrl(getAttr(seasonAnchor, 'href'), url) : null,
-    navigation: {
-      previousEpisodeUrl: navEpisodes[0] || null,
-      nextEpisodeUrl: navEpisodes[1] || null
-    }
-  };
-}
-
 export function parseEpisode(html, url, serverConfigs = []) {
   const doc = parseHTML(html);
   const detail = parseDetail(html, url, { kind: 'episode' });
@@ -486,14 +548,22 @@ export function parseEpisode(html, url, serverConfigs = []) {
   const season = Number(numberMatch[1] || 0) || 0;
   const episode = Number(numberMatch[2] || 0) || 0;
   const title = cleanText(pageHeading.replace(/\s+\d+\s*x\s*\d+\s*$/i, '')) || detail.title;
-  const { seriesUrl, navigation } = parseEpisodeNavigation(doc, url);
-  const { seasons: _seasons, episodes: _episodes, ...episodeDetail } = detail;
   const playerServers = parsePlayerServers(doc, url, serverConfigs);
   const downloads = parseDownloadLinks(doc, url);
+  const seasonAnchor = all(doc, el => el.tag === 'a' && /\/series\//i.test(getAttr(el, 'href')) && /season/i.test(text(el)))[0]
+    || all(doc, el => el.tag === 'a' && /\/series\//i.test(getAttr(el, 'href')))[0];
+  const nav = findClass(doc, 'epsdsnv');
+  const navEpisodes = nav ? all(nav, el => el.tag === 'a' && /\/episode\//i.test(getAttr(el, 'href'))).map(a => absoluteUrl(getAttr(a, 'href'), url)).filter(Boolean) : [];
+  const prev = navEpisodes[0] || null;
+  const next = navEpisodes[1] || null;
   return {
-    ...episodeDetail, kind: 'episode', title, season, episode,
+    ...detail,
+    kind: 'episode', title, episodeTitle: title, season, episode,
     number: season && episode ? `${season}x${episode}` : null,
-    seriesUrl, navigation, playerServers, downloads,
+    seriesUrl: seasonAnchor ? absoluteUrl(getAttr(seasonAnchor, 'href'), url) : null,
+    playerServers, downloads,
+    navigation: { previousEpisodeUrl: prev, nextEpisodeUrl: next },
+    serverConfigCount: serverConfigs.length,
     streamCount: playerServers.length, downloadCount: downloads.length
   };
 }
@@ -501,11 +571,11 @@ export function parseEpisode(html, url, serverConfigs = []) {
 export function parseMovie(html, url, serverConfigs = []) {
   const doc = parseHTML(html);
   const detail = parseDetail(html, url, { kind: 'movie' });
-  const { seasons: _seasons, episodes: _episodes, ...movieDetail } = detail;
   const playerServers = parsePlayerServers(doc, url, serverConfigs);
   const downloads = parseDownloadLinks(doc, url);
   return {
-    ...movieDetail, kind: 'movie', playerServers, downloads,
+    ...detail, kind: 'movie', playerServers, downloads,
+    serverConfigCount: serverConfigs.length,
     streamCount: playerServers.length, downloadCount: downloads.length
   };
 }
@@ -530,8 +600,10 @@ export function parseSeason(html, url, itemId, seasonNumber) {
   return { itemId, season, url, count: unique.length, episodes: unique };
 }
 
-
-
 export function parseServerConfigJson(value) {
   return normalizeServerConfig(value);
+}
+
+export function parseSeoFromHtml(html, url) {
+  return parseSeo(parseHTML(html), url);
 }
