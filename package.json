@@ -1,17 +1,17 @@
 {
   "name": "tooniboy-scraper",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Encrypted Cloudflare Worker API for catalog metadata, validated playback embeds, and downloads.",
+  "description": "Adaptive, CSS-resilient GET-only Cloudflare Worker with provenance-aware rotating media-host discovery.",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "test": "node --test",
+    "check": "node --check src/index.js && node --check src/parsers.js && node --check src/html.js && node --check src/normalize.js && node --check integration/api.js && node --check tools/live-smoke.mjs",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "check": "node --check src/index.js && node --check src/parsers.js && node --check src/html.js && node --check src/normalize.js"
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.157.0"

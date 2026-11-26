@@ -1,22 +1,18 @@
-name = "tooniboy-scraper"
+name = "TOONIBOY-SCRAPER"
 main = "src/index.js"
-compatibility_date = "2026-11-12"
+compatibility_date = "2026-11-26"
 workers_dev = true
 
 [vars]
-ALLOWED_ORIGINS = "*"
-UPSTREAM_BASE_URL ="https://tooniboy.xyz"
-REQUEST_TIMEOUT_MS = "12000"
-MAX_HTML_BYTES = "5242880"
-CACHE_TTL_SECONDS = "120"
-UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+# Actual upstream HTTPS origin — replace with verified value.
+UPSTREAM_BASE_URL = "https://tooniboy.xyz"
 AES_KEY = ""
-
+# Exact authorized website origins, comma-separated.
+ALLOWED_ORIGINS = "https://watchoanime.pages.dev,http://localhost:8080,http://127.0.0.1:8080"
 
 [[ratelimits]]
 name = "API_RATE_LIMITER"
-namespace_id = "7312459"
+namespace_id = "REPLACE_WITH_YOUR_UNIQUE_NUMERIC_NAMESPACE_ID"
 
 [ratelimits.simple]
 limit = 120
@@ -25,7 +21,3 @@ period = 60
 [observability]
 enabled = true
 head_sampling_rate = 1
-
-# Configure these as secrets; do not commit their values:
-# npx wrangler secret put UPSTREAM_BASE_URL
-# npx wrangler secret put AES_KEY
