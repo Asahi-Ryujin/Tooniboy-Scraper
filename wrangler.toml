@@ -12,7 +12,7 @@ ALLOWED_ORIGINS = "https://watchoanime.pages.dev,http://localhost:8080,http://12
 
 [[ratelimits]]
 name = "API_RATE_LIMITER"
-namespace_id = "REPLACE_WITH_YOUR_UNIQUE_NUMERIC_NAMESPACE_ID"
+namespace_id = "18112010"
 
 [ratelimits.simple]
 limit = 120
