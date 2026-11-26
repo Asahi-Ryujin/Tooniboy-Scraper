@@ -256,7 +256,7 @@ export function absoluteUrl(raw, baseUrl) {
 
 export function mediaUrl(node, baseUrl) {
   if (!node) return '';
-  for (const key of ['src', 'data-src', 'data-lazy-src', 'data-original', 'data-image', 'data-url', 'poster', 'data-lazy-srcset']) {
+  for (const key of ['src', 'data-src', 'data-lazy-src', 'data-original', 'data-image', 'data-url', 'data-embed', 'data-embed-url', 'data-iframe', 'data-iframe-src', 'data-player', 'data-player-url', 'data-video', 'data-video-src', 'data-file', 'data-source', 'data-link', 'data-href', 'value', 'poster', 'data-srcset', 'data-lazy-srcset']) {
     const raw = getAttr(node, key);
     if (raw) {
       if (key.includes('srcset')) {

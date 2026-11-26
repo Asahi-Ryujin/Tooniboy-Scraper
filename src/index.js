@@ -1,29 +1,116 @@
 import {
-  parseGenres, parseListing, parseHome, parseDetail, parseEpisode,
-  parseMovie, parseSeason, normalizeServerConfig, parseServerConfigJson
+  parseGenres,
+  parseListing,
+  parseHome,
+  parseDetail,
+  parseEpisode,
+  parseMovie,
+  parseSeason,
+  parseServerConfigJson
 } from './parsers.js';
-import { toPublicData, filterPublicServerConfigs } from './normalize.js';
+import { toPublicData, safeInternalPath, filterPublicServerConfigs } from './normalize.js';
 
-const VERSION = '1.1.0';
+const VERSION = '2.0.0';
 const encoder = new TextEncoder();
-const MAX_PAGE_BYTES_DEFAULT = 5 * 1024 * 1024;
+const MAX_HTML_BYTES_DEFAULT = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 12_000;
 const DEFAULT_CACHE_TTL = 120;
+const MAX_REDIRECTS = 5;
+
+function httpError(status, code, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  return error;
+}
 
 function asInt(value, fallback, min, max) {
-  const n = Number.parseInt(String(value ?? ''), 10);
-  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+
+function allowedOrigins(env) {
+  return String(env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(value => {
+      if (!value || value === '*') return false;
+      try {
+        const parsed = new URL(value);
+        return parsed.origin === value && ['https:', 'http:'].includes(parsed.protocol);
+      } catch { return false; }
+    });
+}
+
+function isOriginAllowed(origin, env) {
+  if (!origin) return true;
+  const list = allowedOrigins(env);
+  return list.includes(origin);
+}
+
+function corsHeaders(request, env) {
+  const origin = request.headers.get('Origin');
+  const headers = new Headers({
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Accept, Authorization',
+    'Access-Control-Max-Age': '86400',
+    'Access-Control-Expose-Headers': 'X-API-Version, X-API-Encryption, X-Request-ID, Retry-After',
+    'Vary': 'Origin',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
+  });
+  if (origin && isOriginAllowed(origin, env)) headers.set('Access-Control-Allow-Origin', origin);
+  return headers;
+}
+
+function constantTimeEqual(left, right) {
+  const a = encoder.encode(String(left));
+  const b = encoder.encode(String(right));
+  let diff = a.length ^ b.length;
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) diff |= (a[i] || 0) ^ (b[i] || 0);
+  return diff === 0;
+}
+
+function authorize(request, env) {
+  const configured = String(env.API_ACCESS_TOKEN || '');
+  if (!configured) return;
+  const header = request.headers.get('Authorization') || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match || !constantTimeEqual(match[1], configured)) {
+    throw httpError(401, 'unauthorized', 'A valid bearer token is required.');
+  }
+}
+
+async function enforceRateLimit(request, env, path) {
+  const limiter = env.API_RATE_LIMITER;
+  if (!limiter || typeof limiter.limit !== 'function') {
+    throw httpError(503, 'rate_limiter_unavailable', 'The API rate-limit binding is not configured.');
+  }
+  const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown-client';
+  const delta = path === '/api/search' ? 3
+    : /^\/api\/season\//.test(path) || /^\/api\/series\/[^/]+\/season\//.test(path) ? 4
+      : /^\/api\/(?:series|movie|movies|episode)\//.test(path) ? 2 : 1;
+  let result;
+  try {
+    result = await limiter.limit({ key: clientIp, delta });
+  } catch {
+    throw httpError(503, 'rate_limiter_error', 'The API rate-limit service is temporarily unavailable.');
+  }
+  if (!result?.success) throw httpError(429, 'rate_limit_exceeded', 'Request limit exceeded. Retry later.');
 }
 
 function siteBase(env) {
   const raw = String(env.UPSTREAM_BASE_URL || '').trim();
-  if (!raw) throw httpError(503, 'upstream_not_configured', 'The upstream service is not configured.');
-  let url;
-  try { url = new URL(raw); } catch { throw httpError(503, 'upstream_not_configured', 'The upstream service configuration is invalid.'); }
-  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || (url.pathname && url.pathname !== '/')) {
-    throw httpError(503, 'upstream_not_configured', 'The upstream service must be a valid HTTPS origin.');
+  if (!raw) throw httpError(503, 'upstream_not_configured', 'The upstream origin is not configured.');
+  let parsed;
+  try { parsed = new URL(raw); }
+  catch { throw httpError(503, 'upstream_not_configured', 'The upstream origin configuration is invalid.'); }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== '/')) {
+    throw httpError(503, 'upstream_not_configured', 'UPSTREAM_BASE_URL must be an HTTPS origin without credentials, path, query, or fragment.');
   }
-  return url.origin;
+  return parsed.origin;
 }
 
 function safePathPart(raw, allowNested = false) {
@@ -37,39 +124,39 @@ function safePathPart(raw, allowNested = false) {
   if (parts.some(part => !part || part === '.' || part === '..' || !/^[\p{L}\p{N}_.,!()'’&:+% -]+$/u.test(part))) {
     throw httpError(400, 'invalid_path', 'Path contains unsupported characters.');
   }
-  return parts.map(part => encodeURIComponent(part).replace(/%3A/gi, ':').replace(/%27/gi, "'").replace(/%26/gi, '&').replace(/%2C/gi, ',').replace(/%21/gi, '!').replace(/%28/gi, '(').replace(/%29/gi, ')')).join('/');
+  return parts.map(part => encodeURIComponent(part)
+    .replace(/%3A/gi, ':').replace(/%27/gi, "'").replace(/%26/gi, '&')
+    .replace(/%2C/gi, ',').replace(/%21/gi, '!').replace(/%28/gi, '(')
+    .replace(/%29/gi, ')')).join('/');
 }
 
-function httpError(status, code, message, details = undefined) {
-  const error = new Error(message);
-  error.status = status;
-  error.code = code;
-  if (details !== undefined) error.details = details;
-  return error;
+function listingType(value) {
+  const type = String(value || 'all').toLowerCase();
+  if (!['all', 'series', 'movies'].includes(type)) {
+    throw httpError(400, 'invalid_type', 'type must be all, series, or movies.');
+  }
+  return type;
 }
 
-function corsHeaders(request, env) {
-  const origin = request.headers.get('Origin');
-  const configured = String(env.ALLOWED_ORIGINS || '*').split(',').map(x => x.trim()).filter(Boolean);
-  const allowAll = configured.includes('*');
-  const allowed = !origin || allowAll || configured.includes(origin);
-  const headers = new Headers({
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-    'Access-Control-Max-Age': '86400',
-    'Vary': 'Origin',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer'
-  });
-  if (origin && allowed) headers.set('Access-Control-Allow-Origin', allowAll ? '*' : origin);
-  else if (!origin && allowAll) headers.set('Access-Control-Allow-Origin', '*');
-  return headers;
+function pageNumber(value) {
+  if (value != null && !/^\d+$/.test(String(value))) {
+    throw httpError(400, 'invalid_page', 'page must be a positive integer.');
+  }
+  return asInt(value, 1, 1, 500);
+}
+
+function categoryPagePath(slug, type, page) {
+  const safeSlug = safePathPart(slug, true);
+  const params = new URLSearchParams({ type, page: String(page) });
+  return `/category/${safeSlug}?${params.toString()}`;
 }
 
 async function readLimitedText(response, maxBytes) {
   if (!response.body?.getReader) {
     const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > maxBytes) throw httpError(502, 'upstream_too_large', 'The upstream page exceeded the configured response-size limit.');
+    if (encoder.encode(text).byteLength > maxBytes) {
+      throw httpError(502, 'upstream_too_large', 'Upstream content exceeded the configured size limit.');
+    }
     return text;
   }
   const reader = response.body.getReader();
@@ -81,39 +168,124 @@ async function readLimitedText(response, maxBytes) {
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
-        try { await reader.cancel('response_limit_exceeded'); } catch {}
-        throw httpError(502, 'upstream_too_large', 'The upstream page exceeded the configured response-size limit.');
+        try { await reader.cancel('response_limit_exceeded'); } catch { /* ignore */ }
+        throw httpError(502, 'upstream_too_large', 'Upstream content exceeded the configured size limit.');
       }
       chunks.push(value);
     }
   } finally {
-    try { reader.releaseLock(); } catch {}
+    try { reader.releaseLock(); } catch { /* ignore */ }
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder('utf-8').decode(bytes);
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+}
+
+async function fetchSite(path, env, options = {}) {
+  const base = siteBase(env);
+  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) {
+    throw httpError(400, 'invalid_upstream_path', 'Only relative paths on the configured upstream origin are allowed.');
+  }
+  const target = new URL(path, `${base}/`);
+  if (target.protocol !== 'https:' || target.origin !== base) {
+    throw httpError(400, 'invalid_upstream_path', 'The requested path resolves outside the configured upstream origin.');
+  }
+
+  const timeoutMs = asInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 1000, 30_000);
+  const maxBytes = asInt(env.MAX_HTML_BYTES, MAX_HTML_BYTES_DEFAULT, 128 * 1024, 10 * 1024 * 1024);
+  const ttl = (options.xhr || options.cache === false) ? 0 : asInt(options.cacheTtl ?? env.CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL, 0, 3600);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('upstream_timeout'), timeoutMs);
+  const headers = new Headers({
+    'Accept': options.json ? 'application/json,text/plain,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+    'Accept-Language': env.ACCEPT_LANGUAGE || 'en-US,en;q=0.9',
+    'User-Agent': env.UPSTREAM_USER_AGENT || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+  });
+  if (options.xhr) headers.set('X-Requested-With', 'XMLHttpRequest');
+  if (options.referer) {
+    const referer = new URL(options.referer, `${base}/`);
+    if (referer.protocol !== 'https:' || referer.origin !== base) {
+      throw httpError(400, 'invalid_referer', 'The XHR referer must belong to the configured upstream origin.');
+    }
+    headers.set('Referer', referer.href);
+  }
+
+  let current = target;
+  try {
+    let response;
+    for (let redirects = 0; ; redirects++) {
+      response = await fetch(current.href, {
+        method: 'GET',
+        headers,
+        redirect: 'manual',
+        signal: controller.signal,
+        ...(ttl > 0 ? { cf: { cacheTtl: ttl, cacheEverything: true, cacheTtlByStatus: { '200-299': ttl, '300-599': 0 } } } : {})
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers.get('location');
+      if (!location || redirects >= MAX_REDIRECTS) {
+        try { await response.body?.cancel(); } catch { /* ignore */ }
+        throw httpError(502, 'redirect_limit', 'Upstream redirect limit exceeded.');
+      }
+      const next = new URL(location, current.href);
+      if (next.protocol !== 'https:' || next.origin !== base) {
+        try { await response.body?.cancel(); } catch { /* ignore */ }
+        throw httpError(502, 'unsafe_redirect', 'Upstream attempted to redirect outside the configured origin.');
+      }
+      try { await response.body?.cancel(); } catch { /* ignore */ }
+      current = next;
+    }
+
+    const finalUrl = response.url ? new URL(response.url) : current;
+    if (finalUrl.protocol !== 'https:' || finalUrl.origin !== base) {
+      try { await response.body?.cancel(); } catch { /* ignore */ }
+      throw httpError(502, 'unsafe_redirect', 'Upstream response came from an unexpected origin.');
+    }
+    if (response.status === 404) throw httpError(404, 'content_not_found', 'The requested upstream content was not found.');
+    if (response.status === 429) throw httpError(503, 'upstream_throttled', 'The upstream service is rate-limiting requests.');
+    if (!response.ok) {
+      throw httpError(response.status >= 500 ? 503 : 502, 'upstream_http_error', `Upstream returned HTTP ${response.status}.`);
+    }
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    if (contentLength > maxBytes) throw httpError(502, 'upstream_too_large', 'Upstream content exceeded the configured size limit.');
+    const body = await readLimitedText(response, maxBytes);
+    if (!options.json && /(?:Just a moment\.\.\.|cf-chl-|challenge-platform|Attention Required! \| Cloudflare)/i.test(body.slice(0, 150_000))) {
+      throw httpError(502, 'upstream_challenge', 'Upstream returned an access challenge rather than the requested content.');
+    }
+    return { body, url: finalUrl.href, status: response.status, contentType: response.headers.get('content-type') || '' };
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === 'AbortError' || error === 'upstream_timeout') {
+      throw httpError(504, 'upstream_timeout', `Upstream request timed out after ${timeoutMs} ms.`);
+    }
+    if (error?.status) throw error;
+    throw httpError(502, 'upstream_fetch_failed', 'Could not retrieve the requested content from the upstream service.');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function bytesToBase64(bytes) {
   let binary = '';
   const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
   }
   return btoa(binary);
 }
 
 async function deriveAes128Key(secret) {
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(secret));
-  // SHA-256 gives 32 bytes. First 16 bytes provide the 128-bit AES key requested.
-  const rawAes128 = new Uint8Array(digest).slice(0, 16);
-  return crypto.subtle.importKey('raw', rawAes128, { name: 'AES-GCM' }, false, ['encrypt']);
+  const rawKey = new Uint8Array(digest).slice(0, 16);
+  return crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt']);
 }
 
 async function encryptPayload(payload, secret) {
-  if (!secret || String(secret).length < 8) {
-    throw httpError(503, 'missing_aes_key', 'Response encryption is not configured.');
+  if (!secret || String(secret).length < 32) {
+    throw httpError(503, 'missing_aes_key', 'AES_KEY must be configured as a high-entropy secret of at least 32 characters.');
   }
   const key = await deriveAes128Key(String(secret));
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -130,23 +302,24 @@ async function encryptPayload(payload, secret) {
   };
 }
 
-async function jsonResponse(request, env, payload, status = 200, extraHeaders = {}) {
+async function jsonResponse(request, env, payload, status = 200) {
   const headers = corsHeaders(request, env);
   headers.set('Content-Type', 'application/json; charset=utf-8');
   headers.set('Cache-Control', 'no-store');
   headers.set('X-API-Encryption', 'AES-128-GCM');
-  for (const [name, value] of Object.entries(extraHeaders)) headers.set(name, String(value));
-  let envelope;
+  headers.set('X-API-Version', VERSION);
   try {
-    envelope = await encryptPayload(payload, env.AES_KEY);
+    const envelope = await encryptPayload(payload, env.AES_KEY);
+    return new Response(JSON.stringify(envelope), { status, headers });
   } catch (error) {
-    if (error.code === 'missing_aes_key') {
-      headers.delete('X-API-Encryption');
-      return new Response(JSON.stringify({ success: false, error: { code: error.code, message: error.message } }), { status: 503, headers });
+    headers.delete('X-API-Encryption');
+    if (error?.code === 'missing_aes_key') {
+      return new Response(JSON.stringify({ success: false, error: { code: error.code, message: error.message } }), {
+        status: 503, headers
+      });
     }
     throw error;
   }
-  return new Response(JSON.stringify(envelope), { status, headers });
 }
 
 async function plainJsonResponse(request, env, payload, status = 200) {
@@ -156,265 +329,376 @@ async function plainJsonResponse(request, env, payload, status = 200) {
   return new Response(JSON.stringify(payload), { status, headers });
 }
 
-async function fetchSite(path, env, options = {}) {
-  const base = siteBase(env);
-  let target = new URL(path, `${base}/`);
-  if (target.origin !== base) throw httpError(400, 'invalid_upstream', 'The requested upstream path is not permitted.');
-  const timeoutMs = asInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 1000, 30_000);
-  const maxBytes = asInt(env.MAX_HTML_BYTES, MAX_PAGE_BYTES_DEFAULT, 128 * 1024, 10 * 1024 * 1024);
-  const ttl = options.xhr ? 0 : asInt(env.CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL, 0, 3600);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('upstream_timeout'), timeoutMs);
-  const headers = new Headers({
-    'Accept': options.json ? 'application/json,text/plain,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
-    'Accept-Language': env.ACCEPT_LANGUAGE || 'en-US,en;q=0.9',
-    'User-Agent': env.UPSTREAM_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
-  });
-  if (options.xhr) headers.set('X-Requested-With', 'XMLHttpRequest');
-  if (options.referer) headers.set('Referer', new URL(options.referer, `${base}/`).href);
-  try {
-    let response;
-    let redirects = 0;
-    while (true) {
-      response = await fetch(target.href, {
-        method: 'GET', headers, redirect: 'manual', signal: controller.signal,
-        ...(ttl > 0 ? { cf: { cacheTtl: ttl, cacheEverything: true } } : {})
-      });
-      if (![301, 302, 303, 307, 308].includes(response.status)) break;
-      const location = response.headers.get('location');
-      if (!location || redirects >= 5) {
-        try { await response.body?.cancel(); } catch {}
-        throw httpError(502, 'redirect_limit', 'Upstream returned a missing redirect target or exceeded the redirect limit.');
-      }
-      const next = new URL(location, target.href);
-      if (next.protocol !== 'https:' || next.origin !== base) {
-        try { await response.body?.cancel(); } catch {}
-        throw httpError(502, 'unsafe_redirect', 'Upstream redirect target is not permitted.');
-      }
-      try { await response.body?.cancel(); } catch {}
-      target = next;
-      redirects++;
-    }
-    const finalUrl = response.url ? new URL(response.url) : target;
-    if (finalUrl.origin !== base || finalUrl.protocol !== 'https:') {
-      throw httpError(502, 'unsafe_redirect', 'Upstream response came from an unexpected origin.');
-    }
-    if (!response.ok) {
-      throw httpError(response.status >= 400 && response.status < 500 ? 502 : 503, 'upstream_http_error', `The upstream service returned HTTP ${response.status}.`);
-    }
-    const contentLength = Number(response.headers.get('content-length') || 0);
-    if (contentLength > maxBytes) throw httpError(502, 'upstream_too_large', 'The upstream page exceeded the configured response-size limit.');
-    const body = await readLimitedText(response, maxBytes);
-    if (!options.json && /(?:Just a moment\.\.\.|cf-chl-|challenge-platform|Attention Required! \| Cloudflare)/i.test(body.slice(0, 150_000))) {
-      throw httpError(502, 'upstream_challenge', 'The upstream returned a verification page instead of the requested content.');
-    }
-    return { body, url: finalUrl.href, status: response.status, contentType: response.headers.get('content-type') || '' };
-  } catch (error) {
-    if (controller.signal.aborted || error?.name === 'AbortError' || error === 'upstream_timeout') throw httpError(504, 'upstream_timeout', `The upstream request timed out after ${timeoutMs} ms.`);
-    if (error?.status) throw error;
-    throw httpError(502, 'upstream_fetch_failed', 'Could not retrieve the requested content from the upstream service.');
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function categoryPagePath(slug, type, page) {
-  const safeSlug = safePathPart(slug, true);
-  const params = new URLSearchParams();
-  params.set('type', type);
-  params.set('page', String(page));
-  return `/category/${safeSlug}?${params.toString()}`;
-}
-
-function listingType(value) {
-  const type = String(value || 'all').toLowerCase();
-  if (!['all', 'series', 'movies'].includes(type)) throw httpError(400, 'invalid_type', 'type must be all, series, or movies.');
-  return type;
-}
-
-function wrapData(data, baseUrl = '') {
-  return { success: true, version: VERSION, data: toPublicData(data, baseUrl) };
+function wrapData(data, baseUrl = '', env = {}) {
+  return { success: true, version: VERSION, data: toPublicData(data, baseUrl, env.MEDIA_ALLOWED_HOSTS || '') };
 }
 
 async function getServerConfigs(base, env) {
   try {
-    const result = await fetchSite('/public/servers', env, { json: true, referer: `${base}/` });
-    let parsed;
-    try { parsed = JSON.parse(result.body); }
-    catch { return []; }
+    const result = await fetchSite('/public/servers', env, { json: true, referer: `${base}/`, cacheTtl: 45 });
+    const parsed = JSON.parse(result.body);
     return parseServerConfigJson(parsed);
   } catch {
+    // The server mapping service is an optional upstream helper. Player URLs
+    // found directly in the page remain usable when this endpoint is absent.
     return [];
   }
 }
 
-function pathFromSlug(prefix, slug) {
+function detailRoutePath(prefix, slug) {
   return `/${prefix}/${safePathPart(slug)}`;
 }
 
-async function routeApi(request, env, ctx) {
+async function detailResponse(request, env, base, upstreamPath, kind) {
+  const needsServerConfig = kind === 'episode' || kind === 'movie';
+  const [page, configs] = await Promise.all([
+    fetchSite(upstreamPath, env, { cacheTtl: kind === 'episode' || kind === 'movie' ? 30 : 90 }),
+    needsServerConfig ? getServerConfigs(base, env) : Promise.resolve([])
+  ]);
+  let data;
+  if (kind === 'episode') data = parseEpisode(page.body, page.url, configs);
+  else if (kind === 'movie') data = parseMovie(page.body, page.url, configs);
+  else data = parseDetail(page.body, page.url, { kind: 'series' });
+  return jsonResponse(request, env, wrapData(data, base, env));
+}
+
+const ROUTE_CATALOG = [
+  '/', '/health', '/healthz', '/api/health', '/api/diagnostics', '/api/diagnostics/parse?path=...', '/api/capabilities',
+  '/api/home', '/api/homepage', '/api/latest?type=all|series|movies|episodes', '/api/latest-series', '/api/latest-movies', '/api/latest-episodes', '/api/newly-uploaded', '/api/suggestions', '/api/genres', '/api/categories', '/api/languages', '/api/networks',
+  '/api/genre/:slug', '/api/category/:slug', '/api/genres/:slug', '/api/categories/:slug',
+  '/api/network/:slug', '/api/networks/:slug', '/api/language/:slug', '/api/languages/:slug',
+  '/api/series', '/api/movies', '/api/catalog', '/api/listing', '/api/browse', '/api/search',
+  '/api/series/:slug', '/api/movie/:slug', '/api/movies/:slug', '/api/episode/:slug',
+  '/api/details?path=/series/:slug|/movies/:slug|/episode/:slug',
+  '/api/season/:seriesSlug/:season', '/api/series/:seriesSlug/season/:season', '/api/servers'
+];
+
+function diagnosticsData(env) {
+  return {
+    service: 'tooniboy-scraper', version: VERSION,
+    methods: ['GET', 'HEAD', 'OPTIONS'],
+    upstreamConfigured: Boolean(String(env.UPSTREAM_BASE_URL || '').trim() && !String(env.UPSTREAM_BASE_URL).includes('REPLACE_WITH')),
+    rateLimiterConfigured: Boolean(env.API_RATE_LIMITER && typeof env.API_RATE_LIMITER.limit === 'function'),
+    encryptionConfigured: Boolean(String(env.AES_KEY || '').length >= 32),
+    parser: {
+      mode: 'multi-strategy',
+      strategies: ['source-structure', 'semantic-link-graph', 'JSON-LD', 'OpenGraph', 'data-attributes', 'player-script-config', 'encoded-script-config'],
+      cssClassDependency: 'fallback-supported',
+      dynamicMediaHostDiscovery: true
+    },
+    cache: {
+      defaultEdgeTtlSeconds: asInt(env.CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL, 0, 3600),
+      detailEdgeTtlSeconds: { series: 90, movie: 30, episode: 30 },
+      seasonXhrTtlSeconds: 0,
+      encryptedApiResponse: 'no-store'
+    },
+    routes: ROUTE_CATALOG
+  };
+}
+
+async function parseDiagnostics(sourcePath, env) {
+  const raw = String(sourcePath || '').trim();
+  if (!raw || raw.length > 512 || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) {
+    throw httpError(400, 'invalid_diagnostic_path', 'Provide a safe relative upstream path.');
+  }
+  let parsed;
+  try { parsed = new URL(raw, 'https://internal.invalid'); } catch { throw httpError(400, 'invalid_diagnostic_path', 'The diagnostic path is malformed.'); }
+  if (parsed.origin !== 'https://internal.invalid') throw httpError(400, 'invalid_diagnostic_path', 'Absolute origins are not accepted.');
+  const path = parsed.pathname;
+  const allowed = path === '/home' || /^\/(?:category|series|movies|episode)\//i.test(path) || path === '/s';
+  if (!allowed) throw httpError(400, 'invalid_diagnostic_path', 'Only home, category, search, series, movie, and episode pages can be inspected.');
+  const page = await fetchSite(`${path}${parsed.search}`, env, { cache: false });
+  let kind = 'unknown';
+  let parsedData = {};
+  if (path === '/home') { kind = 'home'; parsedData = parseHome(page.body, page.url); }
+  else if (path === '/s' || path.startsWith('/category/')) { kind = path === '/s' ? 'search' : 'listing'; parsedData = parseListing(page.body, page.url, { type: kind }); }
+  else if (path.startsWith('/series/')) { kind = 'series'; parsedData = parseDetail(page.body, page.url, { kind: 'series' }); }
+  else if (path.startsWith('/movies/')) { kind = 'movie'; parsedData = parseMovie(page.body, page.url, []); }
+  else if (path.startsWith('/episode/')) { kind = 'episode'; parsedData = parseEpisode(page.body, page.url, []); }
+  return {
+    kind, sourcePath: path,
+    upstream: { status: page.status, contentType: page.contentType, bytes: new TextEncoder().encode(page.body).byteLength },
+    extraction: {
+      title: parsedData.title || null,
+      itemCount: Array.isArray(parsedData.items) ? parsedData.items.length : 0,
+      sectionCount: Array.isArray(parsedData.sections) ? parsedData.sections.length : 0,
+      seasonCount: Array.isArray(parsedData.seasons) ? parsedData.seasons.length : 0,
+      episodeCount: Array.isArray(parsedData.episodes) ? parsedData.episodes.length : 0,
+      playerLinks: Array.isArray(parsedData.playerServers) ? parsedData.playerServers.length : 0,
+      downloadLinks: Array.isArray(parsedData.downloads) ? parsedData.downloads.length : 0,
+      categoryCount: Array.isArray(parsedData.categories) ? parsedData.categories.length : 0,
+      parserMode: 'source-structure + semantic fallback + structured metadata'
+    }
+  };
+}
+
+async function routeApi(request, env) {
   const incoming = new URL(request.url);
   const path = incoming.pathname.replace(/\/+$/, '') || '/';
-  const q = incoming.searchParams;
+  const query = incoming.searchParams;
 
   if (path === '/api/health') {
-    return jsonResponse(request, env, wrapData({ status: 'ok', encryption: 'AES-128-GCM' }));
+    return jsonResponse(request, env, wrapData({ status: 'ok', apiVersion: VERSION, encryption: 'AES-128-GCM' }, '', env));
+  }
+  if (path === '/api/diagnostics' || path === '/api/capabilities') {
+    return jsonResponse(request, env, wrapData(diagnosticsData(env), '', env));
+  }
+  if (path === '/api/diagnostics/parse') {
+    return jsonResponse(request, env, wrapData(await parseDiagnostics(query.get('path'), env), '', env));
   }
 
   const base = siteBase(env);
 
-  if (path === '/api/home') {
+  if (path === '/api/home' || path === '/api/homepage') {
     const page = await fetchSite('/home', env);
-    return jsonResponse(request, env, wrapData(parseHome(page.body, page.url), base));
+    return jsonResponse(request, env, wrapData(parseHome(page.body, page.url), base, env));
   }
 
-  if (path === '/api/genres') {
+  // Collection aliases are derived from the real homepage sections. They do
+  // not assume a separate upstream endpoint or synthesize catalogue records.
+  if (['/api/latest', '/api/latest-series', '/api/latest-movies', '/api/latest-episodes', '/api/newly-uploaded', '/api/suggestions'].includes(path)) {
     const page = await fetchSite('/home', env);
-    const data = parseGenres(page.body, page.url);
-    const group = String(q.get('group') || '').toLowerCase();
-    if (group) {
-      if (!data.groups[group]) throw httpError(404, 'genre_group_not_found', `Unknown genre group: ${group}`);
-      const items = data.groups[group];
-      return jsonResponse(request, env, wrapData({ group, count: items.length, items }, base));
+    const home = parseHome(page.body, page.url);
+    let requestedType = String(query.get('type') || 'all').toLowerCase();
+    if (path === '/api/latest-series') requestedType = 'series';
+    if (path === '/api/latest-movies') requestedType = 'movies';
+    if (path === '/api/latest-episodes' || path === '/api/newly-uploaded') requestedType = 'episodes';
+    if (!['all', 'series', 'movies', 'episodes'].includes(requestedType)) {
+      throw httpError(400, 'invalid_type', 'type must be all, series, movies, or episodes.');
     }
-    return jsonResponse(request, env, wrapData(data, base));
+    let selected;
+    if (path === '/api/suggestions') {
+      selected = home.sections.filter(section => /suggest|recommend/i.test(section.title || ''));
+    } else if (path === '/api/newly-uploaded' || path === '/api/latest-episodes') {
+      selected = home.sections.filter(section => section.type === 'episodes' || /new.{0,20}upload|latest.{0,20}episode|recent.{0,20}episode/i.test(section.title || ''));
+    } else {
+      selected = home.sections.filter(section => /latest|new|recent|upload/i.test(section.title || ''));
+      if (requestedType !== 'all') selected = selected.filter(section => section.type === requestedType);
+    }
+    if (requestedType !== 'all' && (path === '/api/latest' || path === '/api/latest-series' || path === '/api/latest-movies' || path === '/api/latest-episodes' || path === '/api/newly-uploaded')) {
+      selected = selected.filter(section => section.type === requestedType);
+    }
+    if (!selected.length) throw httpError(404, 'collection_not_found', 'The upstream homepage does not currently expose a matching collection.');
+    const seen = new Set();
+    const items = selected.flatMap(section => Array.isArray(section.items) ? section.items : []).filter(item => {
+      const key = item.path || item.url || item.title;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    const title = path === '/api/suggestions' ? 'Suggestions'
+      : requestedType === 'episodes' ? 'Newly Uploaded Episodes'
+        : requestedType === 'series' ? 'Latest Series'
+          : requestedType === 'movies' ? 'Latest Movies' : 'Latest Collections';
+    return jsonResponse(request, env, wrapData({ title, type: requestedType, count: items.length, items, sections: selected }, base, env));
   }
 
-  const genreMatch = path.match(/^\/api\/(?:genre|genres|category)\/(.+)$/i);
+  if (path === '/api/genres' || path === '/api/categories' || path === '/api/languages' || path === '/api/networks') {
+    const page = await fetchSite('/home', env);
+    const parsed = parseGenres(page.body, page.url);
+    if (path === '/api/languages' || path === '/api/networks') {
+      const group = path === '/api/languages' ? 'language' : 'networks';
+      const items = parsed.groups[group] || [];
+      return jsonResponse(request, env, wrapData({ group, count: items.length, items }, base, env));
+    }
+    const group = String(query.get('group') || '').trim().toLowerCase();
+    if (group) {
+      if (!Object.hasOwn(parsed.groups, group)) throw httpError(404, 'genre_group_not_found', 'The requested category group was not found.');
+      const items = parsed.groups[group];
+      return jsonResponse(request, env, wrapData({ group, count: items.length, items }, base, env));
+    }
+    return jsonResponse(request, env, wrapData(parsed, base, env));
+  }
+
+  const genreMatch = path.match(/^\/api\/(?:genre|category|genres|categories|network|networks)\/(.+)$/i);
   if (genreMatch) {
-    const slug = genreMatch[1];
-    const type = listingType(q.get('type'));
-    const pageNo = asInt(q.get('page'), 1, 1, 500);
+    const slug = safePathPart(genreMatch[1], true);
+    const type = listingType(query.get('type'));
+    const pageNo = pageNumber(query.get('page'));
     const upstreamPath = categoryPagePath(slug, type, pageNo);
     const page = await fetchSite(upstreamPath, env);
-    const data = parseListing(page.body, page.url, { category: decodeURIComponent(slug), type });
-    return jsonResponse(request, env, wrapData(data, base));
+    const data = parseListing(page.body, page.url, { category: slug, type });
+    return jsonResponse(request, env, wrapData(data, base, env));
+  }
+
+  const languageMatch = path.match(/^\/api\/(?:language|languages)\/(.+)$/i);
+  if (languageMatch) {
+    let slug = safePathPart(languageMatch[1], true);
+    if (!slug.toLowerCase().startsWith('language/')) slug = `language/${slug}`;
+    const type = listingType(query.get('type'));
+    const pageNo = pageNumber(query.get('page'));
+    const upstreamPath = categoryPagePath(slug, type, pageNo);
+    const page = await fetchSite(upstreamPath, env);
+    const data = parseListing(page.body, page.url, { category: slug, type });
+    return jsonResponse(request, env, wrapData(data, base, env));
+  }
+
+  if (path === '/api/movies' || path === '/api/series') {
+    const defaultType = path === '/api/movies' ? 'movies' : 'series';
+    const type = listingType(query.get('type') || defaultType);
+    const pageNo = pageNumber(query.get('page'));
+    // The captured taxonomy uses the shared /category/anime endpoint with a
+    // type filter; it does not establish a dedicated /category/movies route.
+    const category = 'anime';
+    const params = new URLSearchParams({ type, page: String(pageNo) });
+    const page = await fetchSite(`/category/${category}?${params.toString()}`, env);
+    const data = parseListing(page.body, page.url, { category, type });
+    return jsonResponse(request, env, wrapData(data, base, env));
   }
 
   if (path === '/api/catalog') {
-    const type = listingType(q.get('type'));
-    const pageNo = asInt(q.get('page'), 1, 1, 500);
-    const page = await fetchSite(`/category/anime?${new URLSearchParams({ type, page: String(pageNo) })}`, env);
-    const data = parseListing(page.body, page.url, { category: 'anime', type });
-    return jsonResponse(request, env, wrapData(data, base));
+    const type = listingType(query.get('type'));
+    const pageNo = pageNumber(query.get('page'));
+    const category = safePathPart(query.get('category') || 'anime', true);
+    const params = new URLSearchParams({ type, page: String(pageNo) });
+    const page = await fetchSite(`/category/${category}?${params.toString()}`, env);
+    const data = parseListing(page.body, page.url, { category, type });
+    return jsonResponse(request, env, wrapData(data, base, env));
+  }
+
+  if (path === '/api/browse') {
+    const rawPath = String(query.get('path') || '').trim();
+    const rawCategory = String(query.get('category') || query.get('slug') || '').trim();
+    let slug = '';
+    if (rawPath) {
+      if (!rawPath.startsWith('/category/')) throw httpError(400, 'invalid_browse_path', 'path must begin with /category/.');
+      const clean = safeInternalPath(rawPath);
+      if (!clean || clean.split('/').filter(Boolean).length < 2) throw httpError(400, 'invalid_browse_path', 'Invalid category path.');
+      slug = safePathPart(clean.replace(/^\/category\//, '').replace(/\/$/, ''), true);
+    } else if (rawCategory) {
+      slug = safePathPart(rawCategory, true);
+    } else {
+      throw httpError(400, 'missing_browse_target', 'Provide category=slug or path=/category/slug.');
+    }
+    const type = listingType(query.get('type'));
+    const pageNo = pageNumber(query.get('page'));
+    const page = await fetchSite(categoryPagePath(slug, type, pageNo), env);
+    const data = parseListing(page.body, page.url, { category: slug, type });
+    data.browsePath = `/category/${slug}`;
+    return jsonResponse(request, env, wrapData(data, base, env));
+  }
+
+  if (path === '/api/listing') {
+    const rawPath = String(query.get('path') || '');
+    if (!rawPath.startsWith('/category/')) throw httpError(400, 'invalid_listing_path', 'path must begin with /category/.');
+    const clean = safeInternalPath(rawPath);
+    if (!clean || clean.split('/').filter(Boolean).length < 2) throw httpError(400, 'invalid_listing_path', 'Invalid category path.');
+    const slug = safePathPart(clean.replace(/^\/category\//, '').replace(/\/$/, ''), true);
+    const type = listingType(query.get('type'));
+    const pageNo = pageNumber(query.get('page'));
+    const page = await fetchSite(categoryPagePath(slug, type, pageNo), env);
+    const data = parseListing(page.body, page.url, { category: slug, type });
+    return jsonResponse(request, env, wrapData(data, base, env));
   }
 
   if (path === '/api/search') {
-    const term = String(q.get('q') || q.get('s') || '').trim();
-    if (term.length < 2 || term.length > 100) throw httpError(400, 'invalid_query', 'q must contain 2 to 100 characters.');
-    const pageNo = asInt(q.get('page'), 1, 1, 500);
-    const searchParams = new URLSearchParams({ s: term, ...(pageNo > 1 ? { page: String(pageNo) } : {}) });
-    const page = await fetchSite(`/?${searchParams.toString()}`, env);
+    const term = String(query.get('q') || query.get('s') || '').trim();
+    if (term.length < 2 || term.length > 100 || /[\u0000-\u001f]/.test(term)) {
+      throw httpError(400, 'invalid_query', 'q must contain 2 to 100 printable characters.');
+    }
+    const pageNo = pageNumber(query.get('page'));
+    const params = new URLSearchParams({ q: term });
+    if (pageNo > 1) params.set('page', String(pageNo));
+    const page = await fetchSite(`/s?${params.toString()}`, env);
     const data = parseListing(page.body, page.url, { type: 'search' });
     data.query = term;
-    return jsonResponse(request, env, wrapData(data, base));
+    return jsonResponse(request, env, wrapData(data, base, env));
+  }
+
+  const seasonMatch = path.match(/^\/api\/season\/([^/]+)\/(\d+)$/i)
+    || path.match(/^\/api\/series\/([^/]+)\/season\/(\d+)$/i);
+  if (seasonMatch) {
+    const seriesSlug = safePathPart(seasonMatch[1]);
+    const season = asInt(seasonMatch[2], 1, 1, 100);
+    const seriesPath = `/series/${seriesSlug}`;
+    const detailPage = await fetchSite(seriesPath, env);
+    const detail = parseDetail(detailPage.body, detailPage.url, { kind: 'series' });
+    const record = detail.seasons.find(item => Number(item.season) === season);
+    if (!record) throw httpError(404, 'season_not_found', 'The requested season is not listed for this series.');
+    const seasonPath = safeInternalPath(record.path) || `${seriesPath}/season/${season}`;
+    const page = await fetchSite(seasonPath, env, { xhr: true, referer: detailPage.url });
+    const data = parseSeason(page.body, page.url, seriesPath, season);
+    data.series = { title: detail.title, path: seriesPath };
+    return jsonResponse(request, env, wrapData(data, base, env));
+  }
+
+  const episodeMatch = path.match(/^\/api\/episode\/(.+)$/i);
+  if (episodeMatch) {
+    const upstreamPath = detailRoutePath('episode', episodeMatch[1]);
+    return detailResponse(request, env, base, upstreamPath, 'episode');
+  }
+
+  const movieMatch = path.match(/^\/api\/(?:movie|movies)\/(.+)$/i);
+  if (movieMatch) {
+    const upstreamPath = detailRoutePath('movies', movieMatch[1]);
+    return detailResponse(request, env, base, upstreamPath, 'movie');
+  }
+
+  const seriesMatch = path.match(/^\/api\/series\/(.+)$/i);
+  if (seriesMatch) {
+    const upstreamPath = detailRoutePath('series', seriesMatch[1]);
+    return detailResponse(request, env, base, upstreamPath, 'series');
+  }
+
+  if (path === '/api/details') {
+    const rawPath = String(query.get('path') || '');
+    const clean = safeInternalPath(rawPath);
+    if (!clean) throw httpError(400, 'invalid_detail_path', 'A valid relative detail path is required.');
+    const parts = clean.split('/').filter(Boolean);
+    if (parts.length !== 2 || !['series', 'movies', 'episode'].includes(parts[0])) {
+      throw httpError(400, 'invalid_detail_path', 'path must be /series/:slug, /movies/:slug, or /episode/:slug.');
+    }
+    const upstreamPath = `/${parts[0]}/${safePathPart(parts[1])}`;
+    const kind = parts[0] === 'series' ? 'series' : parts[0] === 'movies' ? 'movie' : 'episode';
+    return detailResponse(request, env, base, upstreamPath, kind);
   }
 
   if (path === '/api/servers') {
     const configs = await getServerConfigs(base, env);
     const servers = filterPublicServerConfigs(configs);
-    return jsonResponse(request, env, wrapData({ count: servers.length, servers }, base));
-  }
-
-  const seasonMatch = path.match(/^\/api\/season\/([^/]+)\/(\d+)$/i);
-  if (seasonMatch) {
-    const slug = safePathPart(seasonMatch[1]);
-    const season = asInt(seasonMatch[2], 1, 1, 100);
-    const seriesPath = `/series/${slug}`;
-    const detailPage = await fetchSite(seriesPath, env);
-    const detail = parseDetail(detailPage.body, detailPage.url, { kind: 'series' });
-    const seasonRecord = detail.seasons.find(x => Number(x.season) === season);
-    const seasonPath = seasonRecord?.path || `${seriesPath}/season/${season}`;
-    const page = await fetchSite(seasonPath, env, { xhr: true, referer: detailPage.url });
-    const data = parseSeason(page.body, page.url, seriesPath, season);
-    data.series = { title: detail.title };
-    data.requestHeaders = { 'X-Requested-With': 'XMLHttpRequest' };
-    return jsonResponse(request, env, wrapData(data, base));
-  }
-
-  const episodeMatch = path.match(/^\/api\/episode\/(.+)$/i);
-  if (episodeMatch) {
-    const episodePath = pathFromSlug('episode', episodeMatch[1]);
-    const [page, configs] = await Promise.all([
-      fetchSite(episodePath, env), getServerConfigs(base, env)
-    ]);
-    const data = parseEpisode(page.body, page.url, configs);
-    return jsonResponse(request, env, wrapData(data, base));
-  }
-
-  const movieMatch = path.match(/^\/api\/(?:movie|movies)\/(.+)$/i);
-  if (movieMatch) {
-    const moviePath = pathFromSlug('movies', movieMatch[1]);
-    const [page, configs] = await Promise.all([
-      fetchSite(moviePath, env), getServerConfigs(base, env)
-    ]);
-    const data = parseMovie(page.body, page.url, configs);
-    return jsonResponse(request, env, wrapData(data, base));
-  }
-
-  const seriesMatch = path.match(/^\/api\/series\/(.+)$/i);
-  if (seriesMatch) {
-    const seriesPath = pathFromSlug('series', seriesMatch[1]);
-    const page = await fetchSite(seriesPath, env);
-    const data = parseDetail(page.body, page.url, { kind: 'series' });
-    return jsonResponse(request, env, wrapData(data, base));
-  }
-
-  if (path === '/api/details') {
-    const raw = String(q.get('path') || '');
-    if (!/^\/(?:series|movies|episode)\//i.test(raw)) throw httpError(400, 'invalid_detail_path', 'path must begin with /series/, /movies/, or /episode/.');
-    const safe = safePathPart(raw.replace(/^\//, ''), true);
-    const upstreamPath = `/${safe}`;
-    const page = await fetchSite(upstreamPath, env);
-    let data;
-    if (/^\/episode\//i.test(upstreamPath)) {
-      const configs = await getServerConfigs(base, env);
-      data = parseEpisode(page.body, page.url, configs);
-    } else if (/^\/movies\//i.test(upstreamPath)) {
-      const configs = await getServerConfigs(base, env);
-      data = parseMovie(page.body, page.url, configs);
-    } else {
-      data = parseDetail(page.body, page.url, { kind: 'series' });
-    }
-    return jsonResponse(request, env, wrapData(data, base));
+    return jsonResponse(request, env, wrapData({ count: servers.length, servers }, base, env));
   }
 
   throw httpError(404, 'route_not_found', 'The requested API endpoint does not exist.');
 }
 
-async function handle(request, env = {}, ctx = {}) {
+async function handleRequest(request, env = {}) {
   const method = request.method.toUpperCase();
-  if (method === 'OPTIONS') {
-    const headers = corsHeaders(request, env);
-    return new Response(null, { status: 204, headers });
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  if (!isOriginAllowed(request.headers.get('Origin'), env)) {
+    return plainJsonResponse(request, env, { success: false, error: { code: 'origin_not_allowed', message: 'This origin is not permitted.' } }, 403);
   }
 
-  if (method !== 'POST') {
-    const payload = {
-      success: false,
-      version: VERSION,
-      error: {
-        code: 'method_not_allowed',
-        message: 'Only POST and OPTIONS are supported.'
-      }
-    };
-    try {
-      return await jsonResponse(request, env, payload, 405, { Allow: 'POST, OPTIONS' });
-    } catch (error) {
-      return plainJsonResponse(request, env, {
-        success: false,
-        error: { code: error?.code || 'method_not_allowed', message: error?.message || payload.error.message }
-      }, Number(error?.status) || 503);
-    }
-  }
+  if (method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(request, env) });
 
-  const path = new URL(request.url).pathname;
   if (path === '/' || path === '/health' || path === '/healthz') {
-    return plainJsonResponse(request, env, { success: true, version: VERSION, status: 'ok' });
+    if (method !== 'GET' && method !== 'HEAD') {
+      const response = await plainJsonResponse(request, env, { success: false, error: { code: 'method_not_allowed', message: 'Only GET, HEAD, and OPTIONS are supported.' } }, 405);
+      return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+    }
+    const response = await plainJsonResponse(request, env, { success: true, service: 'tooniboy-scraper', version: VERSION, status: 'ok' });
+    return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+  }
+
+  if (!path.startsWith('/api/')) {
+    const response = await plainJsonResponse(request, env, { success: false, error: { code: 'route_not_found', message: 'The requested endpoint does not exist.' } }, 404);
+    return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+  }
+
+  if (method !== 'GET' && method !== 'HEAD') {
+    const response = await jsonResponse(request, env, { success: false, version: VERSION, error: { code: 'method_not_allowed', message: 'Only GET, HEAD, and OPTIONS are supported.' } }, 405);
+    return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
   }
 
   try {
-    return await routeApi(request, env, ctx);
+    if (path.startsWith('/api/')) {
+      authorize(request, env);
+      if (path !== '/api/health') await enforceRateLimit(request, env, path);
+    }
+    const response = await routeApi(request, env);
+    return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
   } catch (error) {
     const status = Number(error?.status) || 500;
     const payload = {
@@ -425,15 +709,66 @@ async function handle(request, env = {}, ctx = {}) {
         message: error?.message || 'Unexpected Worker error.'
       }
     };
-    try { return await jsonResponse(request, env, payload, status); }
-    catch (encryptionError) {
-      return plainJsonResponse(request, env, {
+    try {
+      const response = await jsonResponse(request, env, payload, status);
+      return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+    } catch (encryptionError) {
+      const response = await plainJsonResponse(request, env, {
         success: false,
-        error: { code: encryptionError?.code || 'response_encryption_failed', message: encryptionError?.message || 'Could not encrypt API response.' }
+        error: {
+          code: encryptionError?.code || 'response_encryption_failed',
+          message: encryptionError?.message || 'Could not encrypt the API response.'
+        }
       }, Number(encryptionError?.status) || 503);
+      return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
     }
   }
 }
 
+async function handle(request, env = {}) {
+  const startedAt = Date.now();
+  const requestId = crypto.randomUUID();
+  const requestUrl = new URL(request.url);
+  let response;
+  try {
+    response = await handleRequest(request, env);
+  } catch (error) {
+    // Keep the outer boundary as a final containment layer for unexpected
+    // failures not already converted into a typed API response.
+    response = await plainJsonResponse(request, env, {
+      success: false,
+      error: { code: 'internal_error', message: 'The Worker could not complete this request.', requestId }
+    }, 500);
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set('X-Request-ID', requestId);
+  headers.set('X-API-Version', VERSION);
+  const finalized = new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+
+  // Structured logs intentionally omit query strings, search terms, tokens,
+  // raw upstream URLs, response bodies, and media host URLs.
+  let originHost = null;
+  try { originHost = request.headers.get('Origin') ? new URL(request.headers.get('Origin')).host : null; } catch { /* Invalid Origin is logged as null. */ }
+  const logEntry = {
+    event: 'api_request',
+    requestId,
+    method: request.method.toUpperCase(),
+    path: requestUrl.pathname,
+    status: finalized.status,
+    durationMs: Date.now() - startedAt,
+    origin: originHost
+  };
+  if (String(env.OBSERVABILITY_LOGS ?? 'true').toLowerCase() !== 'false') {
+    if (finalized.status >= 500) console.error(JSON.stringify(logEntry));
+    else console.log(JSON.stringify(logEntry));
+  }
+  return finalized;
+}
+
 export default { fetch: handle };
-export { handle, encryptPayload, deriveAes128Key, fetchSite };
+export { handle, handleRequest, encryptPayload, deriveAes128Key, fetchSite, diagnosticsData, parseDiagnostics, ROUTE_CATALOG };
